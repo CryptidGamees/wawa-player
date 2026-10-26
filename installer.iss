@@ -8,6 +8,7 @@ DefaultDirName={autopf}\GlassPlayer
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=output
+SetupIconFile=icon.ico
 OutputBaseFilename=WawaPlayer-Setup
 Compression=lzma2
 SolidCompression=yes

@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import time
+import random
 import shutil
 import locale
 import ctypes
@@ -21,12 +22,12 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer, QPoint, QUrl
 from PySide6.QtGui import (QColor, QPainter, QLinearGradient, QRadialGradient,
-                           QPixmap, QPainterPath, QFont, QPalette, QDesktopServices)
+                           QPixmap, QPainterPath, QFont, QPalette, QDesktopServices, QIcon)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QFrame, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QListWidget, QListWidgetItem, QSlider, QComboBox,
     QProgressBar, QMessageBox, QStackedWidget, QButtonGroup, QMenu,
-    QFileDialog, QInputDialog, QCheckBox,
+    QFileDialog, QInputDialog, QCheckBox, QScrollArea,
 )
 
 # ================================================================ paths
@@ -49,8 +50,16 @@ if hasattr(os, "add_dll_directory"):
     os.add_dll_directory(str(BIN_DIR))
 
 
+def resource_path(name):
+    if hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / name
+    return Path(__file__).resolve().parent / name
+
+
 # ================================================================ config + library
-DEFAULT_CFG = {"volume": 70, "autoplay": True, "quality": "best", "blur": True}
+DEFAULT_CFG = {"volume": 70, "autoplay": True, "quality": "best",
+               "glass_blur": False, "shuffle": False,
+               "theme": "light", "language": "en"}
 
 
 def load_json(path, default):
@@ -298,6 +307,26 @@ def apply_backdrop(hwnd):
         pass
 
 
+def apply_blur_win10(hwnd):
+    """Experimental blur-behind for Windows 10 (undocumented Windows API)."""
+    try:
+        class ACCENT(ctypes.Structure):
+            _fields_ = [("state", ctypes.c_int), ("flags", ctypes.c_int),
+                        ("color", ctypes.c_uint), ("anim", ctypes.c_int)]
+
+        class DATA(ctypes.Structure):
+            _fields_ = [("attr", ctypes.c_int), ("data", ctypes.c_void_p),
+                        ("size", ctypes.c_size_t)]
+
+        accent = ACCENT(4, 2, 0x33FFFFFF, 0)  # acrylic blur, tint is AABBGGRR
+        data = DATA(19, ctypes.cast(ctypes.pointer(accent), ctypes.c_void_p),
+                    ctypes.sizeof(accent))
+        ctypes.windll.user32.SetWindowCompositionAttribute(
+            ctypes.c_void_p(hwnd), ctypes.byref(data))
+    except Exception:
+        pass
+
+
 # ================================================================ threads
 class Task(QThread):
     ok = Signal(object)
@@ -325,7 +354,7 @@ class SetupWorker(QThread):
             for name, path, installer in DEPENDENCIES:
                 if path.exists():
                     continue
-                self.status.emit(f"Downloading {name}...")
+                self.status.emit(tr("Downloading {name}...").format(name=tr(name)))
                 self.progress.emit(0)
                 installer(self.progress.emit)
             self.progress.emit(100)
@@ -337,17 +366,17 @@ class SetupWorker(QThread):
 class SetupDialog(QDialog):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("First-time setup")
+        self.setWindowTitle(tr("First-time setup"))
         self.setMinimumWidth(440)
-        self.label = QLabel("Preparing...")
+        self.label = QLabel(tr("Preparing..."))
         self.bar = QProgressBar()
-        self.retry = QPushButton("Retry")
+        self.retry = QPushButton(tr("Retry"))
         self.retry.hide()
         self.retry.clicked.connect(self.start)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 24, 24, 24)
         lay.setSpacing(12)
-        lay.addWidget(QLabel("<b>Setting things up</b><br>This only happens once."))
+        lay.addWidget(QLabel(tr("<b>Setting things up</b><br>This only happens once.")))
         lay.addWidget(self.label)
         lay.addWidget(self.bar)
         lay.addWidget(self.retry)
@@ -363,51 +392,243 @@ class SetupDialog(QDialog):
         self.worker.start()
 
     def on_fail(self, msg):
-        self.label.setText(f"Setup failed: {msg}\nCheck your internet and retry.")
+        self.label.setText(tr("Setup failed: {msg}\nCheck your internet and retry.").format(msg=msg))
         self.retry.show()
 
 
 # ================================================================ style
-STYLE = """
-QWidget { color: #f4f3fa; font-family: 'Segoe UI Variable Text','Segoe UI'; font-size: 13px; }
-QDialog, QMessageBox, QInputDialog { background: #1d1a30; }
-QFrame#glass { background: rgba(255,255,255,20); border: 1px solid rgba(255,255,255,42); border-radius: 24px; }
-QFrame#pill { background: rgba(255,255,255,16); border: 1px solid rgba(255,255,255,30); border-radius: 20px; }
-QLineEdit { background: rgba(255,255,255,24); border: 1px solid rgba(255,255,255,40);
-            border-radius: 16px; padding: 8px 14px; selection-background-color: rgba(255,255,255,80); }
-QPushButton { background: rgba(255,255,255,24); border: 1px solid rgba(255,255,255,42);
-              border-radius: 16px; padding: 7px 16px; }
-QPushButton:hover { background: rgba(255,255,255,46); }
-QPushButton:pressed { background: rgba(255,255,255,70); }
+# ================================================================ languages
+LANG = {"code": "en"}
+
+PT = {
+    "First-time setup": "Configuração inicial",
+    "<b>Setting things up</b><br>This only happens once.": "<b>Preparando tudo</b><br>Isso só acontece uma vez.",
+    "Preparing...": "Preparando...",
+    "Retry": "Tentar novamente",
+    "Downloading {name}...": "Baixando {name}...",
+    "yt-dlp (YouTube access)": "yt-dlp (acesso ao YouTube)",
+    "Deno (YouTube helper)": "Deno (auxiliar do YouTube)",
+    "libmpv (audio engine)": "libmpv (motor de áudio)",
+    "Setup failed: {msg}\nCheck your internet and retry.": "A configuração falhou: {msg}\nVerifique sua internet e tente novamente.",
+    "Library": "Biblioteca",
+    "Search": "Buscar",
+    "Settings": "Configurações",
+    "Nothing playing": "Nada tocando",
+    "Vol": "Vol",
+    "Click to change the play order": "Clique para mudar a ordem de reprodução",
+    "Shuffle": "Aleatório",
+    "In order": "Em ordem",
+    "+ Playlist": "+ Playlist",
+    "Delete": "Excluir",
+    "+ Add music files": "+ Adicionar músicas",
+    "Click a song to play it. Right-click for more options.": "Clique em uma música para tocar. Clique com o botão direito para mais opções.",
+    "All songs": "Todas as músicas",
+    "Empty. Add music files or save songs from Search.": "Vazio. Adicione músicas ou salve músicas da aba Buscar.",
+    "Search YouTube...": "Buscar no YouTube...",
+    "Add selected to playlist": "Adicionar selecionadas à playlist",
+    "Save to library": "Salvar na biblioteca",
+    "Searching...": "Buscando...",
+    "No results.": "Nenhum resultado.",
+    "Error: {e}": "Erro: {e}",
+    "Components": "Componentes",
+    "yt-dlp version: ...": "Versão do yt-dlp: ...",
+    "yt-dlp version: {v}": "Versão do yt-dlp: {v}",
+    "installed": "instalado",
+    "missing": "ausente",
+    "Update yt-dlp": "Atualizar yt-dlp",
+    "Re-download Deno": "Baixar o Deno novamente",
+    "Updating yt-dlp...": "Atualizando o yt-dlp...",
+    "Downloading Deno...": "Baixando o Deno...",
+    "Deno updated.": "Deno atualizado.",
+    "Appearance": "Aparência",
+    "Theme": "Tema",
+    "Dark": "Escuro",
+    "Light": "Claro",
+    "Language": "Idioma",
+    "Restarting...": "Reiniciando...",
+    "Preferences": "Preferências",
+    "YouTube audio quality": "Qualidade do áudio do YouTube",
+    "Best": "Melhor",
+    "Data saver": "Economia de dados",
+    "Play the next song automatically": "Tocar a próxima música automaticamente",
+    "Blur window background (experimental, restart needed)": "Desfocar o fundo da janela (experimental, precisa reiniciar)",
+    "Data": "Dados",
+    "Saved in: {path}": "Salvo em: {path}",
+    "Open data folder": "Abrir pasta de dados",
+    "Restart the app to apply this.": "Reinicie o app para aplicar.",
+    "Add music": "Adicionar músicas",
+    "Audio files (*.mp3 *.flac *.m4a *.wav *.ogg *.opus *.aac);;All files (*.*)": "Arquivos de áudio (*.mp3 *.flac *.m4a *.wav *.ogg *.opus *.aac);;Todos os arquivos (*.*)",
+    "Added {n} file(s).": "{n} arquivo(s) adicionado(s).",
+    "New playlist": "Nova playlist",
+    "Playlist name:": "Nome da playlist:",
+    "Delete playlist": "Excluir playlist",
+    "Delete '{pl}'? Your songs stay in the library.": "Excluir '{pl}'? Suas músicas continuam na biblioteca.",
+    "Added {n} song(s) to '{name}'.": "{n} música(s) adicionada(s) a '{name}'.",
+    "Saved {n} song(s) to your library.": "{n} música(s) salva(s) na biblioteca.",
+    "New playlist...": "Nova playlist...",
+    "Play": "Tocar",
+    "Add to playlist": "Adicionar à playlist",
+    "Remove from this playlist": "Remover desta playlist",
+    "Remove from library": "Remover da biblioteca",
+    "Select one or more results first.": "Selecione um ou mais resultados primeiro.",
+    "File not found. It may have been moved.": "Arquivo não encontrado. Ele pode ter sido movido.",
+    "Loading from YouTube...": "Carregando do YouTube...",
+    "Couldn't play this. Try Settings -> Update yt-dlp.": "Não foi possível tocar. Tente Configurações -> Atualizar yt-dlp.",
+    "Startup error": "Erro ao iniciar",
+    "Could not start the audio engine:\n{e}": "Não foi possível iniciar o motor de áudio:\n{e}",
+    "Yes": "Sim",
+    "No": "Não",
+    "OK": "OK",
+    "Cancel": "Cancelar",
+}
+
+
+def tr(text):
+    if LANG["code"] == "pt":
+        return PT.get(text, text)
+    return text
+
+
+# ================================================================ themes
+THEMES = {
+    "dark": dict(
+        text="#f4f6ff", dim="rgba(255,255,255,170)", faint="rgba(255,255,255,125)",
+        dialog="#10163a",
+        panel="rgba(5,9,30,150)", panel_border="rgba(255,255,255,55)",
+        pill="rgba(255,255,255,18)", pill_border="rgba(255,255,255,32)",
+        ctl="rgba(255,255,255,24)", ctl_border="rgba(255,255,255,42)",
+        ctl_hover="rgba(255,255,255,46)", ctl_press="rgba(255,255,255,70)",
+        tab_on="rgba(255,255,255,72)", hover="rgba(255,255,255,24)",
+        sel="rgba(255,255,255,58)", big="rgba(255,255,255,60)",
+        groove="rgba(255,255,255,55)", fill="rgba(255,255,255,225)", handle="#ffffff",
+        menu="#141a42", menu_border="rgba(255,255,255,55)", menu_sel="rgba(255,255,255,45)",
+        grad=((76, 116, 240), (10, 22, 78)),
+        pal=dict(window=(16, 22, 58), text=(244, 246, 255), base=(24, 32, 72),
+                 button=(36, 46, 96), hl=(84, 118, 238), hltext=(255, 255, 255)),
+    ),
+    "light": dict(
+        text="#14213d", dim="rgba(20,33,61,165)", faint="rgba(20,33,61,125)",
+        dialog="#eef2ff",
+        panel="rgba(255,255,255,125)", panel_border="rgba(255,255,255,190)",
+        pill="rgba(255,255,255,90)", pill_border="rgba(255,255,255,160)",
+        ctl="rgba(255,255,255,115)", ctl_border="rgba(20,33,61,45)",
+        ctl_hover="rgba(255,255,255,175)", ctl_press="rgba(255,255,255,215)",
+        tab_on="rgba(255,255,255,205)", hover="rgba(255,255,255,95)",
+        sel="rgba(70,100,215,70)", big="rgba(255,255,255,205)",
+        groove="rgba(20,33,61,45)", fill="rgba(40,80,210,235)", handle="#2a50d2",
+        menu="#f4f7ff", menu_border="rgba(20,33,61,60)", menu_sel="rgba(70,100,215,55)",
+        grad=((84, 124, 240), (242, 246, 255)),
+        pal=dict(window=(238, 242, 255), text=(20, 33, 61), base=(255, 255, 255),
+                 button=(224, 231, 250), hl=(84, 118, 238), hltext=(255, 255, 255)),
+    ),
+}
+
+STYLE_TEMPLATE = """
+QWidget { color: @text@; font-family: 'Segoe UI Variable Text','Segoe UI'; font-size: 13px; }
+QDialog, QMessageBox, QInputDialog { background: @dialog@; }
+QFrame#glass { background: @panel@; border: 1px solid @panel_border@; border-radius: 24px; }
+QFrame#pill { background: @pill@; border: 1px solid @pill_border@; border-radius: 20px; }
+QLabel#dim { color: @dim@; }
+QLabel#small { color: @faint@; font-size: 11px; }
+QLineEdit { background: @ctl@; border: 1px solid @ctl_border@; border-radius: 16px;
+            padding: 8px 14px; selection-background-color: @sel@; }
+QPushButton { background: @ctl@; border: 1px solid @ctl_border@; border-radius: 16px; padding: 7px 16px; }
+QPushButton:hover { background: @ctl_hover@; }
+QPushButton:pressed { background: @ctl_press@; }
 QPushButton#tab { background: transparent; border: none; border-radius: 16px;
-                  padding: 8px 20px; color: rgba(255,255,255,165); }
-QPushButton#tab:checked { background: rgba(255,255,255,72); color: white; }
+                  padding: 8px 20px; color: @dim@; }
+QPushButton#tab:checked { background: @tab_on@; color: @text@; }
 QPushButton#icon { font-size: 20px; background: transparent; border: none; padding: 6px 16px; }
-QPushButton#icon:hover { background: rgba(255,255,255,30); }
-QPushButton#big { font-size: 22px; background: rgba(255,255,255,60); padding: 6px 20px; }
-QComboBox { background: rgba(255,255,255,24); border: 1px solid rgba(255,255,255,42);
-            border-radius: 16px; padding: 7px 14px; }
+QPushButton#icon:hover { background: @hover@; }
+QPushButton#big { font-size: 22px; background: @big@; padding: 6px 20px; }
+QComboBox { background: @ctl@; border: 1px solid @ctl_border@; border-radius: 16px; padding: 7px 14px; }
 QComboBox::drop-down { border: none; width: 26px; }
-QComboBox QAbstractItemView { background: #2a2540; border: 1px solid rgba(255,255,255,50);
-                              selection-background-color: rgba(255,255,255,50); outline: 0; }
+QComboBox QAbstractItemView { background: @menu@; border: 1px solid @menu_border@;
+                              selection-background-color: @menu_sel@; selection-color: @text@; outline: 0; }
 QListWidget { background: transparent; border: none; outline: 0; }
 QListWidget::item { padding: 8px 10px; border-radius: 14px; }
-QListWidget::item:hover { background: rgba(255,255,255,24); }
-QListWidget::item:selected { background: rgba(255,255,255,58); color: white; }
-QSlider::groove:horizontal { height: 4px; background: rgba(255,255,255,55); border-radius: 2px; }
-QSlider::sub-page:horizontal { background: rgba(255,255,255,225); border-radius: 2px; }
-QSlider::handle:horizontal { width: 12px; height: 12px; margin: -4px 0;
-                             background: white; border-radius: 6px; }
-QMenu { background: #2a2540; border: 1px solid rgba(255,255,255,55); border-radius: 12px; padding: 6px; }
+QListWidget::item:hover { background: @hover@; }
+QListWidget::item:selected { background: @sel@; color: @text@; }
+QSlider::groove:horizontal { height: 4px; background: @groove@; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: @fill@; border-radius: 2px; }
+QSlider::handle:horizontal { width: 12px; height: 12px; margin: -4px 0; background: @handle@; border-radius: 6px; }
+QMenu { background: @menu@; border: 1px solid @menu_border@; border-radius: 12px; padding: 6px; }
 QMenu::item { padding: 7px 20px; border-radius: 8px; }
-QMenu::item:selected { background: rgba(255,255,255,45); }
+QMenu::item:selected { background: @menu_sel@; }
+QScrollArea { background: transparent; border: none; }
 QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
-QScrollBar::handle:vertical { background: rgba(255,255,255,70); border-radius: 4px; min-height: 30px; }
+QScrollBar::handle:vertical { background: @groove@; border-radius: 4px; min-height: 30px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QProgressBar { background: rgba(255,255,255,30); border: none; border-radius: 6px;
-               height: 12px; text-align: center; }
-QProgressBar::chunk { background: rgba(255,255,255,210); border-radius: 6px; }
+QProgressBar { background: @groove@; border: none; border-radius: 6px; height: 12px;
+               text-align: center; color: @text@; }
+QProgressBar::chunk { background: @fill@; border-radius: 6px; }
 """
+
+
+def build_style(t):
+    css = STYLE_TEMPLATE
+    for k, v in t.items():
+        if isinstance(v, str):
+            css = css.replace("@" + k + "@", v)
+    return css
+
+
+def apply_theme(app, name):
+    t = THEMES.get(name, THEMES["light"])
+    p = t["pal"]
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor(*p["window"]))
+    pal.setColor(QPalette.WindowText, QColor(*p["text"]))
+    pal.setColor(QPalette.Base, QColor(*p["base"]))
+    pal.setColor(QPalette.AlternateBase, QColor(*p["window"]))
+    pal.setColor(QPalette.Text, QColor(*p["text"]))
+    pal.setColor(QPalette.Button, QColor(*p["button"]))
+    pal.setColor(QPalette.ButtonText, QColor(*p["text"]))
+    pal.setColor(QPalette.Highlight, QColor(*p["hl"]))
+    pal.setColor(QPalette.HighlightedText, QColor(*p["hltext"]))
+    pal.setColor(QPalette.PlaceholderText, QColor(p["text"][0], p["text"][1], p["text"][2], 130))
+    app.setPalette(pal)
+    app.setStyleSheet(build_style(t))
+
+
+def ask_yes_no(parent, title, text):
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setText(text)
+    yes = box.addButton(tr("Yes"), QMessageBox.YesRole)
+    box.addButton(tr("No"), QMessageBox.NoRole)
+    box.exec()
+    return box.buttonRole(box.clickedButton()) == QMessageBox.YesRole
+
+
+def ask_text(parent, title, label):
+    dlg = QInputDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.setLabelText(label)
+    dlg.setOkButtonText(tr("OK"))
+    dlg.setCancelButtonText(tr("Cancel"))
+    ok = dlg.exec()
+    return dlg.textValue().strip(), bool(ok)
+
+
+class LanguageDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Wawa Player")
+        self.setMinimumWidth(380)
+        self.choice = "en"
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.setSpacing(12)
+        lay.addWidget(QLabel("<b>Choose your language / Escolha o idioma</b>"))
+        for code, name in (("en", "English"), ("pt", "Português")):
+            b = QPushButton(tr(name))
+            b.clicked.connect(lambda checked=False, c=code: self.pick(c))
+            lay.addWidget(b)
+
+    def pick(self, code):
+        self.choice = code
+        self.accept()
 
 
 def add_action(menu, text, fn):
@@ -440,11 +661,34 @@ def glass():
 
 
 # ================================================================ main window
+class TrackList(QListWidget):
+    """List that can play a song with a single left click."""
+    clicked_item = Signal(object)
+
+    def __init__(self, single_click=False):
+        super().__init__()
+        self.single_click = single_click
+        self._press = None
+
+    def mousePressEvent(self, e):
+        self._press = self.itemAt(e.position().toPoint())
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        super().mouseReleaseEvent(e)
+        multi = bool(e.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier))
+        if self.single_click and e.button() == Qt.LeftButton and not multi:
+            it = self.itemAt(e.position().toPoint())
+            if it is not None and it is self._press and it.data(Qt.UserRole):
+                self.clicked_item.emit(it)
+
+
 class Bridge(QObject):
     position = Signal(float)
     duration = Signal(float)
     paused = Signal(bool)
     idle = Signal(bool)
+    eof = Signal(bool)
 
 
 class MainWindow(QWidget):
@@ -460,10 +704,11 @@ class MainWindow(QWidget):
         self.lib = Library()
         self.tasks = []
         self.queue, self.qi, self.current = [], -1, None
+        self.history, self.played_ids, self.ended = [], set(), False
         self.dur, self.seeking, self.started, self.got_dur = 0.0, False, False, False
 
-        build = sys.getwindowsversion().build if hasattr(sys, "getwindowsversion") else 0
-        self.acrylic = bool(self.cfg["blur"]) and build >= 22621
+        self.win_build = sys.getwindowsversion().build if hasattr(sys, "getwindowsversion") else 0
+        self.acrylic = bool(self.cfg["glass_blur"]) and self.win_build >= 17134
         if self.acrylic:
             self.setAttribute(Qt.WA_TranslucentBackground, True)
         self._backdrop_done = False
@@ -482,17 +727,19 @@ class MainWindow(QWidget):
             vid="no", ytdl=True, ytdl_format=fmt_str,
             script_opts=f"ytdl_hook-ytdl_path={YTDLP.as_posix()}",
             input_default_bindings=False, input_vo_keyboard=False, osc=False,
-            audio_display="no", demuxer_max_bytes="32MiB", demuxer_max_back_bytes="8MiB")
+            keep_open="yes", audio_display="no", demuxer_max_bytes="32MiB", demuxer_max_back_bytes="8MiB")
         self.player.volume = self.cfg["volume"]
         self.bridge = Bridge()
         self.bridge.position.connect(self.on_pos)
         self.bridge.duration.connect(self.on_dur)
         self.bridge.paused.connect(self.on_paused)
         self.bridge.idle.connect(self.on_idle)
+        self.bridge.eof.connect(self.on_eof)
         self.player.observe_property("time-pos", lambda n, v: v is not None and self.bridge.position.emit(float(v)))
         self.player.observe_property("duration", lambda n, v: v is not None and self.bridge.duration.emit(float(v)))
         self.player.observe_property("pause", lambda n, v: self.bridge.paused.emit(bool(v)))
         self.player.observe_property("idle-active", lambda n, v: self.bridge.idle.emit(bool(v)))
+        self.player.observe_property("eof-reached", lambda n, v: self.bridge.eof.emit(bool(v)))
 
     # ---------------------------------------------------------- UI
     def build_ui(self):
@@ -515,7 +762,7 @@ class MainWindow(QWidget):
         group = QButtonGroup(self)
         group.setExclusive(True)
         for i, name in enumerate(("Library", "Search", "Settings")):
-            b = QPushButton(name)
+            b = QPushButton(tr(name))
             b.setObjectName("tab")
             b.setCheckable(True)
             b.setChecked(i == 0)
@@ -534,7 +781,7 @@ class MainWindow(QWidget):
         ll.addWidget(self.stack, 1)
 
         self.status = QLabel("")
-        self.status.setStyleSheet("color: rgba(255,255,255,170);")
+        self.status.setObjectName("dim")
         ll.addWidget(self.status)
         root.addWidget(left, 1)
 
@@ -549,12 +796,12 @@ class MainWindow(QWidget):
         self.cover.setPixmap(rounded_cover(None, self.COVER))
         rl.addWidget(self.cover, 0, Qt.AlignHCenter)
         rl.addSpacing(10)
-        self.title_lbl = QLabel("Nothing playing")
+        self.title_lbl = QLabel(tr("Nothing playing"))
         self.title_lbl.setStyleSheet("font-size: 18px; font-weight: 600;")
         self.title_lbl.setAlignment(Qt.AlignHCenter)
         self.title_lbl.setWordWrap(True)
         self.artist_lbl = QLabel("")
-        self.artist_lbl.setStyleSheet("color: rgba(255,255,255,170);")
+        self.artist_lbl.setObjectName("dim")
         self.artist_lbl.setAlignment(Qt.AlignHCenter)
         self.artist_lbl.setWordWrap(True)
         rl.addWidget(self.title_lbl)
@@ -568,7 +815,7 @@ class MainWindow(QWidget):
         times = QHBoxLayout()
         self.t_left, self.t_right = QLabel("0:00"), QLabel("0:00")
         for l in (self.t_left, self.t_right):
-            l.setStyleSheet("color: rgba(255,255,255,150); font-size: 11px;")
+            l.setObjectName("small")
         times.addWidget(self.t_left)
         times.addStretch()
         times.addWidget(self.t_right)
@@ -593,7 +840,13 @@ class MainWindow(QWidget):
         rl.addStretch()
 
         vrow = QHBoxLayout()
-        vrow.addWidget(QLabel("Vol"))
+        self.order_btn = QPushButton()
+        self.order_btn.setToolTip(tr("Click to change the play order"))
+        self.order_btn.clicked.connect(self.toggle_order)
+        self.update_order_btn()
+        vrow.addWidget(self.order_btn)
+        vrow.addSpacing(10)
+        vrow.addWidget(QLabel(tr("Vol")))
         self.vol = QSlider(Qt.Horizontal)
         self.vol.setRange(0, 100)
         self.vol.setValue(self.cfg["volume"])
@@ -612,25 +865,25 @@ class MainWindow(QWidget):
         row = QHBoxLayout()
         self.pl_combo = QComboBox()
         self.pl_combo.currentIndexChanged.connect(lambda _: self.refresh_library_list())
-        new = QPushButton("+ Playlist")
+        new = QPushButton(tr("+ Playlist"))
         new.clicked.connect(lambda: self.new_playlist())
-        self.del_pl_btn = QPushButton("Delete")
+        self.del_pl_btn = QPushButton(tr("Delete"))
         self.del_pl_btn.clicked.connect(self.delete_playlist)
         row.addWidget(self.pl_combo, 1)
         row.addWidget(new)
         row.addWidget(self.del_pl_btn)
         lay.addLayout(row)
-        add = QPushButton("+ Add music files")
+        add = QPushButton(tr("+ Add music files"))
         add.clicked.connect(self.add_files)
         lay.addWidget(add)
-        self.lib_list = QListWidget()
+        self.lib_list = TrackList(single_click=True)
         self.lib_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.lib_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.lib_list.customContextMenuRequested.connect(lambda pos: self.track_menu(self.lib_list, pos, "library"))
-        self.lib_list.itemDoubleClicked.connect(lambda it: self.play_item(self.lib_list, it))
+        self.lib_list.clicked_item.connect(lambda it: self.play_item(self.lib_list, it))
         lay.addWidget(self.lib_list, 1)
-        hint = QLabel("Double-click to play. Right-click for more options.")
-        hint.setStyleSheet("color: rgba(255,255,255,120); font-size: 11px;")
+        hint = QLabel(tr("Click a song to play it. Right-click for more options."))
+        hint.setObjectName("small")
         lay.addWidget(hint)
         return w
 
@@ -642,9 +895,9 @@ class MainWindow(QWidget):
         lay.setSpacing(10)
         row = QHBoxLayout()
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search YouTube...")
+        self.search_box.setPlaceholderText(tr("Search YouTube..."))
         self.search_box.returnPressed.connect(self.do_search)
-        go = QPushButton("Search")
+        go = QPushButton(tr("Search"))
         go.clicked.connect(self.do_search)
         row.addWidget(self.search_box, 1)
         row.addWidget(go)
@@ -656,9 +909,9 @@ class MainWindow(QWidget):
         self.res_list.itemDoubleClicked.connect(lambda it: self.play_item(self.res_list, it))
         lay.addWidget(self.res_list, 1)
         brow = QHBoxLayout()
-        self.add_pl_btn = QPushButton("Add selected to playlist")
+        self.add_pl_btn = QPushButton(tr("Add selected to playlist"))
         self.add_pl_btn.clicked.connect(self.search_add_menu)
-        save = QPushButton("Save to library")
+        save = QPushButton(tr("Save to library"))
         save.clicked.connect(lambda: self.save_tracks(self.selected_tracks(self.res_list)))
         brow.addWidget(self.add_pl_btn)
         brow.addWidget(save)
@@ -677,74 +930,99 @@ class MainWindow(QWidget):
             l.setStyleSheet("font-size: 15px; font-weight: 600; margin-top: 8px;")
             return l
 
-        lay.addWidget(head("Components"))
-        self.ver_lbl = QLabel("yt-dlp version: ...")
+        lay.addWidget(head(tr("Components")))
+        self.ver_lbl = QLabel(tr("yt-dlp version: ..."))
         lay.addWidget(self.ver_lbl)
-        lay.addWidget(QLabel("libmpv: " + ("installed" if MPV_DLL.exists() else "missing")))
-        lay.addWidget(QLabel("Deno: " + ("installed" if DENO.exists() else "missing")))
+        lay.addWidget(QLabel("libmpv: " + tr("installed" if MPV_DLL.exists() else "missing")))
+        lay.addWidget(QLabel("Deno: " + tr("installed" if DENO.exists() else "missing")))
         brow = QHBoxLayout()
-        b1 = QPushButton("Update yt-dlp")
-        b1.clicked.connect(lambda: self.run_task(update_ytdlp, "Updating yt-dlp...", refresh=True))
-        b2 = QPushButton("Re-download Deno")
-        b2.clicked.connect(lambda: self.run_task(lambda: (install_deno(), "Deno updated.")[1], "Downloading Deno..."))
+        b1 = QPushButton(tr("Update yt-dlp"))
+        b1.clicked.connect(lambda: self.run_task(update_ytdlp, tr("Updating yt-dlp..."), refresh=True))
+        b2 = QPushButton(tr("Re-download Deno"))
+        b2.clicked.connect(lambda: self.run_task(lambda: (install_deno(), tr("Deno updated."))[1], tr("Downloading Deno...")))
         brow.addWidget(b1)
         brow.addWidget(b2)
         brow.addStretch()
         lay.addLayout(brow)
         self.set_info = QLabel("")
         self.set_info.setWordWrap(True)
-        self.set_info.setStyleSheet("color: rgba(255,255,255,170);")
+        self.set_info.setObjectName("dim")
         lay.addWidget(self.set_info)
 
-        lay.addWidget(head("Preferences"))
+        lay.addWidget(head(tr("Appearance")))
+        trow = QHBoxLayout()
+        trow.addWidget(QLabel(tr("Theme")))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems([tr("Dark"), tr("Light")])
+        self.theme_combo.setCurrentIndex(0 if self.cfg["theme"] == "dark" else 1)
+        self.theme_combo.currentIndexChanged.connect(self.on_theme)
+        trow.addWidget(self.theme_combo)
+        trow.addStretch()
+        lay.addLayout(trow)
+        lrow = QHBoxLayout()
+        lrow.addWidget(QLabel(tr("Language")))
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItems(["English", "Português"])
+        self.lang_combo.setCurrentIndex(1 if self.cfg["language"] == "pt" else 0)
+        self.lang_combo.currentIndexChanged.connect(self.on_language)
+        lrow.addWidget(self.lang_combo)
+        lrow.addStretch()
+        lay.addLayout(lrow)
+
+        lay.addWidget(head(tr("Preferences")))
         qrow = QHBoxLayout()
-        qrow.addWidget(QLabel("YouTube audio quality"))
+        qrow.addWidget(QLabel(tr("YouTube audio quality")))
         self.q_combo = QComboBox()
-        self.q_combo.addItems(["Best", "Data saver"])
+        self.q_combo.addItems([tr("Best"), tr("Data saver")])
         self.q_combo.setCurrentIndex(0 if self.cfg["quality"] == "best" else 1)
         self.q_combo.currentIndexChanged.connect(self.on_quality)
         qrow.addWidget(self.q_combo)
         qrow.addStretch()
         lay.addLayout(qrow)
-        self.auto_chk = QCheckBox("Play the next song automatically")
+        self.auto_chk = QCheckBox(tr("Play the next song automatically"))
         self.auto_chk.setChecked(self.cfg["autoplay"])
         self.auto_chk.toggled.connect(self.on_autoplay)
         lay.addWidget(self.auto_chk)
-        self.blur_chk = QCheckBox("Blur window background (Windows 11, restart needed)")
-        self.blur_chk.setChecked(self.cfg["blur"])
+        self.blur_chk = QCheckBox(tr("Blur window background (experimental, restart needed)"))
+        self.blur_chk.setChecked(self.cfg["glass_blur"])
         self.blur_chk.toggled.connect(self.on_blur)
         lay.addWidget(self.blur_chk)
 
-        lay.addWidget(head("Data"))
-        lay.addWidget(QLabel(f"Saved in: {DATA_DIR}"))
-        op = QPushButton("Open data folder")
+        lay.addWidget(head(tr("Data")))
+        lay.addWidget(QLabel(tr("Saved in: {path}").format(path=DATA_DIR)))
+        op = QPushButton(tr("Open data folder"))
         op.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(DATA_DIR))))
         orow = QHBoxLayout()
         orow.addWidget(op)
         orow.addStretch()
         lay.addLayout(orow)
         lay.addStretch()
-        return w
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QFrame.NoFrame)
+        sa.setWidget(w)
+        sa.viewport().setAutoFillBackground(False)
+        w.setAutoFillBackground(False)
+        return sa
 
     # ---------------------------------------------------------- background
     def paintEvent(self, e):
         p = QPainter(self)
-        a = 190 if self.acrylic else 255
+        a = 205 if self.acrylic else 255
         g = QLinearGradient(0, 0, self.width(), self.height())
-        g.setColorAt(0.0, QColor(18, 20, 36, a))
-        g.setColorAt(0.55, QColor(30, 22, 48, a))
-        g.setColorAt(1.0, QColor(66, 18, 48, a))
+        c1, c2 = THEMES.get(self.cfg.get("theme"), THEMES["light"])["grad"]
+        g.setColorAt(0.0, QColor(c1[0], c1[1], c1[2], a))
+        g.setColorAt(1.0, QColor(c2[0], c2[1], c2[2], a))
         p.fillRect(self.rect(), g)
-        glow = QRadialGradient(self.width() * 0.85, self.height() * 0.9, self.width() * 0.5)
-        glow.setColorAt(0, QColor(190, 40, 90, 90))
-        glow.setColorAt(1, QColor(190, 40, 90, 0))
-        p.fillRect(self.rect(), glow)
 
     def showEvent(self, e):
         super().showEvent(e)
         if self.acrylic and not self._backdrop_done:
             self._backdrop_done = True
-            apply_backdrop(int(self.winId()))
+            if self.win_build >= 22621:
+                apply_backdrop(int(self.winId()))
+            else:
+                apply_blur_win10(int(self.winId()))
 
     # ---------------------------------------------------------- helpers
     def toast(self, text):
@@ -755,13 +1033,13 @@ class MainWindow(QWidget):
         self.set_info.setText(label)
         t = Task(fn)
         t.ok.connect(lambda r: (self.set_info.setText(str(r)), refresh and self.refresh_versions()))
-        t.failed.connect(lambda e: self.set_info.setText(f"Error: {e}"))
+        t.failed.connect(lambda e: self.set_info.setText(tr("Error: {e}").format(e=e)))
         self.tasks.append(t)
         t.start()
 
     def refresh_versions(self):
         t = Task(ytdlp_version)
-        t.ok.connect(lambda v: self.ver_lbl.setText(f"yt-dlp version: {v}"))
+        t.ok.connect(lambda v: self.ver_lbl.setText(tr("yt-dlp version: {v}").format(v=v)))
         self.tasks.append(t)
         t.start()
 
@@ -788,9 +1066,39 @@ class MainWindow(QWidget):
         self.save_cfg()
 
     def on_blur(self, on):
-        self.cfg["blur"] = on
+        self.cfg["glass_blur"] = on
         self.save_cfg()
-        self.set_info.setText("Restart the app to apply this.")
+        self.set_info.setText(tr("Restart the app to apply this."))
+
+    def on_theme(self, i):
+        self.cfg["theme"] = "dark" if i == 0 else "light"
+        apply_theme(QApplication.instance(), self.cfg["theme"])
+        self.save_cfg()
+        self.update()
+
+    def on_language(self, i):
+        code = "pt" if i == 1 else "en"
+        if code == self.cfg["language"]:
+            return
+        self.cfg["language"] = code
+        self.save_cfg()
+        LANG["code"] = code
+        self.set_info.setText(tr("Restarting..."))
+        QTimer.singleShot(700, self.restart_app)
+
+    def restart_app(self):
+        try:
+            self.player.terminate()
+        except Exception:
+            pass
+        try:
+            if getattr(sys, "frozen", False):
+                subprocess.Popen([sys.executable], close_fds=True)
+            else:
+                subprocess.Popen([sys.executable, os.path.abspath(sys.argv[0])], close_fds=True)
+        except Exception:
+            pass
+        os._exit(0)
 
     # ---------------------------------------------------------- library actions
     def current_playlist(self):
@@ -800,7 +1108,7 @@ class MainWindow(QWidget):
     def refresh_playlists(self, select=None):
         self.pl_combo.blockSignals(True)
         self.pl_combo.clear()
-        self.pl_combo.addItem("All songs")
+        self.pl_combo.addItem(tr("All songs"))
         self.pl_combo.addItems(list(self.lib.playlists.keys()))
         if select and select in self.lib.playlists:
             self.pl_combo.setCurrentText(select)
@@ -813,14 +1121,14 @@ class MainWindow(QWidget):
         self.lib_list.clear()
         tracks = self.lib.tracks_in(pl)
         if not tracks:
-            self.lib_list.addItem("Empty. Add music files or save songs from Search.")
+            self.lib_list.addItem(tr("Empty. Add music files or save songs from Search."))
         for t in tracks:
             self.lib_list.addItem(make_item(t))
 
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Add music", str(Path.home() / "Music"),
-            "Audio files (*.mp3 *.flac *.m4a *.wav *.ogg *.opus *.aac);;All files (*.*)")
+            self, tr("Add music"), str(Path.home() / "Music"),
+            tr("Audio files (*.mp3 *.flac *.m4a *.wav *.ogg *.opus *.aac);;All files (*.*)"))
         if not files:
             return
         pl = self.current_playlist()
@@ -831,11 +1139,10 @@ class MainWindow(QWidget):
                 self.lib.playlists[pl].append(t["id"])
         self.lib.save()
         self.refresh_library_list()
-        self.toast(f"Added {len(files)} file(s).")
+        self.toast(tr("Added {n} file(s).").format(n=len(files)))
 
     def new_playlist(self, add=None):
-        name, ok = QInputDialog.getText(self, "New playlist", "Playlist name:")
-        name = name.strip()
+        name, ok = ask_text(self, tr("New playlist"), tr("Playlist name:"))
         if not ok or not name:
             return
         if name not in self.lib.playlists:
@@ -849,8 +1156,8 @@ class MainWindow(QWidget):
         pl = self.current_playlist()
         if not pl:
             return
-        if QMessageBox.question(self, "Delete playlist",
-                                f"Delete '{pl}'? Your songs stay in the library.") == QMessageBox.Yes:
+        if ask_yes_no(self, tr("Delete playlist"),
+                      tr("Delete '{pl}'? Your songs stay in the library.").format(pl=pl)):
             self.lib.playlists.pop(pl, None)
             self.lib.save()
             self.refresh_playlists()
@@ -863,7 +1170,7 @@ class MainWindow(QWidget):
         self.lib.save()
         if self.current_playlist() in (None, name):
             self.refresh_library_list()
-        self.toast(f"Added {len(tracks)} song(s) to '{name}'.")
+        self.toast(tr("Added {n} song(s) to '{name}'.").format(n=len(tracks), name=name))
 
     def save_tracks(self, tracks):
         if not tracks:
@@ -872,14 +1179,14 @@ class MainWindow(QWidget):
             self.lib.add_track(t)
         self.lib.save()
         self.refresh_library_list()
-        self.toast(f"Saved {len(tracks)} song(s) to your library.")
+        self.toast(tr("Saved {n} song(s) to your library.").format(n=len(tracks)))
 
     def fill_playlist_menu(self, menu, tracks):
         for name in self.lib.playlists:
             add_action(menu, name, lambda n=name: self.add_to_playlist(n, tracks))
         if self.lib.playlists:
             menu.addSeparator()
-        add_action(menu, "New playlist...", lambda: self.new_playlist(add=tracks))
+        add_action(menu, tr("New playlist..."), lambda: self.new_playlist(add=tracks))
 
     def selected_tracks(self, lw):
         return [i.data(Qt.UserRole) for i in lw.selectedItems() if i.data(Qt.UserRole)]
@@ -890,15 +1197,15 @@ class MainWindow(QWidget):
             return
         tracks = [i.data(Qt.UserRole) for i in items]
         m = QMenu(self)
-        add_action(m, "Play", lambda: self.play_item(lw, items[0]))
-        self.fill_playlist_menu(m.addMenu("Add to playlist"), tracks)
+        add_action(m, tr("Play"), lambda: self.play_item(lw, items[0]))
+        self.fill_playlist_menu(m.addMenu(tr("Add to playlist")), tracks)
         if where == "library":
             pl = self.current_playlist()
             if pl:
-                add_action(m, "Remove from this playlist", lambda: self.remove_from_playlist(pl, tracks))
-            add_action(m, "Remove from library", lambda: self.remove_from_library(tracks))
+                add_action(m, tr("Remove from this playlist"), lambda: self.remove_from_playlist(pl, tracks))
+            add_action(m, tr("Remove from library"), lambda: self.remove_from_library(tracks))
         else:
-            add_action(m, "Save to library", lambda: self.save_tracks(tracks))
+            add_action(m, tr("Save to library"), lambda: self.save_tracks(tracks))
         m.exec(lw.viewport().mapToGlobal(pos))
 
     def remove_from_playlist(self, pl, tracks):
@@ -917,7 +1224,7 @@ class MainWindow(QWidget):
     def search_add_menu(self):
         tracks = self.selected_tracks(self.res_list)
         if not tracks:
-            self.toast("Select one or more results first.")
+            self.toast(tr("Select one or more results first."))
             return
         m = QMenu(self)
         self.fill_playlist_menu(m, tracks)
@@ -929,17 +1236,17 @@ class MainWindow(QWidget):
         if not q:
             return
         self.res_list.clear()
-        self.res_list.addItem("Searching...")
+        self.res_list.addItem(tr("Searching..."))
         t = Task(lambda: search_youtube(q))
         t.ok.connect(self.show_results)
-        t.failed.connect(lambda e: (self.res_list.clear(), self.res_list.addItem(f"Error: {e}")))
+        t.failed.connect(lambda e: (self.res_list.clear(), self.res_list.addItem(tr("Error: {e}").format(e=e))))
         self.tasks.append(t)
         t.start()
 
     def show_results(self, tracks):
         self.res_list.clear()
         if not tracks:
-            self.res_list.addItem("No results.")
+            self.res_list.addItem(tr("No results."))
         for t in tracks:
             self.res_list.addItem(make_item(t))
 
@@ -949,6 +1256,8 @@ class MainWindow(QWidget):
             return
         self.queue = tracks_of(lw)
         self.qi = lw.row(item)
+        self.history = []
+        self.played_ids = set()
         self.play_current()
 
     def play_current(self):
@@ -956,14 +1265,17 @@ class MainWindow(QWidget):
         if t["kind"] == "file":
             src = t["path"]
             if not os.path.exists(src):
-                self.artist_lbl.setText("File not found. It may have been moved.")
+                self.artist_lbl.setText(tr("File not found. It may have been moved."))
                 return
         else:
             src = f"https://www.youtube.com/watch?v={t['vid']}"
         self.current = t
+        self.ended = False
         self.got_dur = False
+        self.played_ids.add(t["id"])
         self.title_lbl.setText(t["title"])
-        self.artist_lbl.setText(t.get("artist") or "")
+        self.artist_lbl.setText(tr("Loading from YouTube...") if t["kind"] == "yt"
+                                else (t.get("artist") or ""))
         self.seek.setValue(0)
         self.cover.setPixmap(rounded_cover(None, self.COVER))
         self.player.pause = False
@@ -987,10 +1299,27 @@ class MainWindow(QWidget):
         self.tasks.append(task)
         task.start()
 
+    def pick_next_index(self):
+        n = len(self.queue)
+        if n == 0:
+            return None
+        if not self.cfg["shuffle"]:
+            return (self.qi + 1) % n          # in order, wraps to the first song
+        fresh = [i for i, t in enumerate(self.queue) if t["id"] not in self.played_ids]
+        if not fresh:                          # everything played: start a new round
+            self.played_ids = {self.current["id"]} if self.current else set()
+            fresh = [i for i, t in enumerate(self.queue) if t["id"] not in self.played_ids]
+        return random.choice(fresh) if fresh else self.qi
+
     def play_next(self):
-        if self.qi + 1 < len(self.queue):
-            self.qi += 1
-            self.play_current()
+        idx = self.pick_next_index()
+        if idx is None:
+            return
+        if self.qi >= 0:
+            self.history.append(self.qi)
+            del self.history[:-200]
+        self.qi = idx
+        self.play_current()
 
     def play_prev(self):
         if not self.queue:
@@ -999,14 +1328,28 @@ class MainWindow(QWidget):
             pos = self.player.time_pos or 0
         except Exception:
             pos = 0
-        if pos > 3 or self.qi == 0:
+        if self.ended:
+            self.play_current()
+        elif pos > 3 or not self.history:
             self.player.seek(0, reference="absolute")
         else:
-            self.qi -= 1
+            self.qi = self.history.pop()
             self.play_current()
+
+    def toggle_order(self):
+        self.cfg["shuffle"] = not self.cfg["shuffle"]
+        self.played_ids = {self.current["id"]} if self.current else set()
+        self.update_order_btn()
+        self.save_cfg()
+
+    def update_order_btn(self):
+        self.order_btn.setText("\u21C4  " + tr("Shuffle") if self.cfg["shuffle"] else "\u2192  " + tr("In order"))
 
     def toggle_pause(self):
         if not self.current:
+            return
+        if self.ended:
+            self.play_current()
             return
         try:
             if self.player.idle_active:
@@ -1016,7 +1359,19 @@ class MainWindow(QWidget):
             pass
         self.player.pause = not self.player.pause
 
+    def finish_track(self):
+        if self.ended or not self.current:
+            return
+        self.ended = True
+        if self.cfg["autoplay"] and self.queue:
+            self.play_next()
+        else:
+            self.seek.setValue(0)
+            self.t_left.setText("0:00")
+            self.play_btn.setText("\u25B6")
+
     def do_seek(self):
+        self.ended = False
         self.player.seek(self.seek.value(), reference="absolute")
         self.seeking = False
 
@@ -1031,9 +1386,15 @@ class MainWindow(QWidget):
         self.got_dur = True
         self.seek.setRange(0, int(d))
         self.t_right.setText(fmt(d))
+        if self.current:
+            self.artist_lbl.setText(self.current.get("artist") or "")
 
     def on_paused(self, p):
         self.play_btn.setText("\u25B6" if p else "\u275A\u275A")
+
+    def on_eof(self, reached):
+        if reached:
+            self.finish_track()
 
     def on_idle(self, idle):
         if not idle:
@@ -1043,14 +1404,9 @@ class MainWindow(QWidget):
             return
         self.started = False
         if not self.got_dur:
-            self.artist_lbl.setText("Couldn't play this. Try Settings \u2192 Update yt-dlp.")
-            return
-        if self.cfg["autoplay"] and self.qi + 1 < len(self.queue):
-            self.play_next()
+            self.artist_lbl.setText(tr("Couldn't play this. Try Settings -> Update yt-dlp."))
         else:
-            self.seek.setValue(0)
-            self.t_left.setText("0:00")
-            self.play_btn.setText("\u25B6")
+            self.finish_track()
 
     def closeEvent(self, e):
         self.save_cfg()
@@ -1064,20 +1420,23 @@ class MainWindow(QWidget):
 # ================================================================ entry point
 def main():
     app = QApplication(sys.argv)
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("WawaPlayer.App")
+    except Exception:
+        pass
+    icon = resource_path("icon.ico")
+    if icon.exists():
+        app.setWindowIcon(QIcon(str(icon)))
     app.setStyle("Fusion")
-    pal = QPalette()
-    pal.setColor(QPalette.Window, QColor(28, 25, 48))
-    pal.setColor(QPalette.WindowText, Qt.white)
-    pal.setColor(QPalette.Base, QColor(36, 32, 60))
-    pal.setColor(QPalette.AlternateBase, QColor(44, 40, 70))
-    pal.setColor(QPalette.Text, Qt.white)
-    pal.setColor(QPalette.Button, QColor(48, 43, 78))
-    pal.setColor(QPalette.ButtonText, Qt.white)
-    pal.setColor(QPalette.Highlight, QColor(150, 90, 200))
-    pal.setColor(QPalette.HighlightedText, Qt.white)
-    pal.setColor(QPalette.PlaceholderText, QColor(255, 255, 255, 120))
-    app.setPalette(pal)
-    app.setStyleSheet(STYLE)
+    saved = load_json(CFG_FILE, {})
+    cfg = {**DEFAULT_CFG, **saved}
+    apply_theme(app, cfg["theme"])
+    if "language" not in saved:
+        dlg = LanguageDialog()
+        dlg.exec()
+        cfg["language"] = dlg.choice
+        save_json(CFG_FILE, {**saved, "language": dlg.choice})
+    LANG["code"] = cfg["language"] if cfg["language"] in ("en", "pt") else "en"
 
     if not all(path.exists() for _, path, _ in DEPENDENCIES):
         if SetupDialog().exec() != QDialog.Accepted:
@@ -1085,7 +1444,7 @@ def main():
     try:
         win = MainWindow()
     except Exception as e:
-        QMessageBox.critical(None, "Startup error", f"Could not start the audio engine:\n{e}")
+        QMessageBox.critical(None, tr("Startup error"), tr("Could not start the audio engine:\n{e}").format(e=e))
         return
     win.show()
     sys.exit(app.exec())
