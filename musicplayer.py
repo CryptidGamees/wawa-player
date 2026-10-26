@@ -9,6 +9,7 @@ Run:           python musicplayer.py
 import os
 import sys
 import json
+import time
 import shutil
 import locale
 import ctypes
@@ -92,6 +93,17 @@ class Library:
 
 
 # ================================================================ downloading deps
+def retry(fn, tries=40, delay=0.5):
+    """Retry when Windows/antivirus still has a file open (WinError 32)."""
+    for i in range(tries):
+        try:
+            return fn()
+        except OSError:
+            if i == tries - 1:
+                raise
+            time.sleep(delay)
+
+
 def download(url, dest, progress=None):
     dest = Path(dest)
     part = dest.with_suffix(dest.suffix + ".part")
@@ -107,7 +119,7 @@ def download(url, dest, progress=None):
             done += len(chunk)
             if progress and total:
                 progress(int(done * 100 / total))
-    part.replace(dest)
+    retry(lambda: part.replace(dest))
 
 
 def install_ytdlp(progress=None):
@@ -116,7 +128,7 @@ def install_ytdlp(progress=None):
 
 
 def install_deno(progress=None):
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         z = Path(tmp) / "deno.zip"
         download("https://github.com/denoland/deno/releases/latest/download/"
                  "deno-x86_64-pc-windows-msvc.zip", z, progress)
@@ -135,7 +147,7 @@ def install_libmpv(progress=None):
                   and a["name"].endswith(".7z")), None)
     if asset is None:
         raise RuntimeError("Could not find a libmpv download on GitHub.")
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         archive = Path(tmp) / "mpv.7z"
         download(asset["browser_download_url"], archive, progress)
         out = Path(tmp) / "out"
@@ -145,7 +157,7 @@ def install_libmpv(progress=None):
                     if p.name.lower() in ("libmpv-2.dll", "mpv-2.dll")), None)
         if dll is None:
             raise RuntimeError("libmpv DLL not found in the downloaded archive.")
-        shutil.copy2(dll, MPV_DLL)
+        retry(lambda: shutil.copy2(dll, MPV_DLL))
 
 
 DEPENDENCIES = [
