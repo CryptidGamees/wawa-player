@@ -19,7 +19,7 @@ jobs:
         run: pip install PySide6 python-mpv mutagen pyinstaller
 
       - name: Build the app
-        run: pyinstaller --noconfirm --onedir --windowed --name WawaPlayer --hidden-import mpv musicplayer.py
+        run: pyinstaller --noconfirm --onedir --windowed --name WawaPlayer --icon icon.ico --add-data "icon.ico;." --hidden-import mpv musicplayer.py
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
