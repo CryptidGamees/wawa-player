@@ -1,9 +1,9 @@
 """
-Glass Music Player (Windows)
+Wawa Player (Windows)
 Tabs: Library (playlists + local files), Search (YouTube), Settings.
 First launch downloads yt-dlp, Deno and libmpv automatically.
 
-Install once:  pip install PySide6 python-mpv py7zr mutagen
+Install once:  pip install PySide6 python-mpv mutagen
 Run:           python musicplayer.py
 """
 import os
@@ -137,7 +137,6 @@ def install_deno(progress=None):
 
 
 def install_libmpv(progress=None):
-    import py7zr
     api = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
     with urllib.request.urlopen(urllib.request.Request(api, headers=UA), timeout=30) as r:
         release = json.load(r)
@@ -148,11 +147,19 @@ def install_libmpv(progress=None):
     if asset is None:
         raise RuntimeError("Could not find a libmpv download on GitHub.")
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        archive = Path(tmp) / "mpv.7z"
+        tmp = Path(tmp)
+        archive = tmp / "mpv.7z"
+        seven = tmp / "7zr.exe"
+        # 7zr.exe is the tiny official 7-Zip extractor (handles the BCJ2 filter)
+        download("https://www.7-zip.org/a/7zr.exe", seven)
         download(asset["browser_download_url"], archive, progress)
-        out = Path(tmp) / "out"
-        with py7zr.SevenZipFile(archive) as z:
-            z.extractall(out)
+        out = tmp / "out"
+        r = subprocess.run([str(seven), "x", str(archive), f"-o{out}", "-y"],
+                           capture_output=True, text=True,
+                           creationflags=NO_WINDOW, stdin=subprocess.DEVNULL,
+                           timeout=300)
+        if r.returncode != 0:
+            raise RuntimeError("Extraction failed: " + (r.stderr or r.stdout)[-200:])
         dll = next((p for p in out.rglob("*.dll")
                     if p.name.lower() in ("libmpv-2.dll", "mpv-2.dll")), None)
         if dll is None:
@@ -445,7 +452,7 @@ class MainWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Glass Music Player")
+        self.setWindowTitle("Wawa Player")
         self.resize(1000, 660)
         self.setMinimumSize(840, 560)
 
@@ -474,7 +481,8 @@ class MainWindow(QWidget):
         self.player = mpv.MPV(
             vid="no", ytdl=True, ytdl_format=fmt_str,
             script_opts=f"ytdl_hook-ytdl_path={YTDLP.as_posix()}",
-            input_default_bindings=False, input_vo_keyboard=False, osc=False)
+            input_default_bindings=False, input_vo_keyboard=False, osc=False,
+            audio_display="no", demuxer_max_bytes="32MiB", demuxer_max_back_bytes="8MiB")
         self.player.volume = self.cfg["volume"]
         self.bridge = Bridge()
         self.bridge.position.connect(self.on_pos)
