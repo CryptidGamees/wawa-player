@@ -16,10 +16,10 @@ jobs:
           python-version: "3.13"
 
       - name: Install dependencies
-        run: pip install PySide6 python-mpv py7zr mutagen pyinstaller
+        run: pip install PySide6 python-mpv mutagen pyinstaller
 
       - name: Build the app
-        run: pyinstaller --noconfirm --onedir --windowed --name GlassPlayer --hidden-import mpv --collect-all py7zr --collect-all pyppmd --collect-all bcj --collect-all inflate64 musicplayer.py
+        run: pyinstaller --noconfirm --onedir --windowed --name WawaPlayer --hidden-import mpv musicplayer.py
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
@@ -29,5 +29,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: GlassPlayer-Setup
-          path: output/GlassPlayer-Setup.exe
+          name: WawaPlayer-Setup
+          path: output/WawaPlayer-Setup.exe
