@@ -16,10 +16,10 @@ jobs:
           python-version: "3.13"
 
       - name: Install dependencies
-        run: pip install PySide6 python-mpv mutagen pyinstaller
+        run: pip install PySide6 python-mpv mutagen pypresence pyinstaller
 
       - name: Build the app
-        run: pyinstaller --noconfirm --onedir --windowed --name WawaPlayer --icon icon.ico --add-data "icon.ico;." --hidden-import mpv musicplayer.py
+        run: pyinstaller --noconfirm --onedir --windowed --name WawaPlayer --icon icon.ico --add-data "icon.ico;." --hidden-import mpv --hidden-import pypresence musicplayer.py
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
