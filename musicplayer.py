@@ -3,13 +3,16 @@ Wawa Player (Windows)
 Tabs: Library (playlists + local files), Search (YouTube), Settings.
 First launch downloads yt-dlp, Deno and libmpv automatically.
 
-Install once:  pip install PySide6 python-mpv mutagen
+Install once:  pip install PySide6 python-mpv mutagen pypresence
 Run:           python musicplayer.py
 """
 import os
 import sys
 import json
+import re
 import time
+import queue
+import threading
 import random
 import shutil
 import locale
@@ -20,14 +23,16 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer, QPoint, QUrl
+from PySide6.QtCore import (Qt, QThread, Signal, QObject, QTimer, QPoint, QUrl,
+                            QPropertyAnimation, QEasingCurve)
 from PySide6.QtGui import (QColor, QPainter, QLinearGradient, QRadialGradient,
                            QPixmap, QPainterPath, QFont, QPalette, QDesktopServices, QIcon)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QFrame, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QListWidget, QListWidgetItem, QSlider, QComboBox,
     QProgressBar, QMessageBox, QStackedWidget, QButtonGroup, QMenu,
-    QFileDialog, QInputDialog, QCheckBox, QScrollArea,
+    QFileDialog, QInputDialog, QCheckBox, QScrollArea, QGraphicsOpacityEffect,
+    QAbstractItemView,
 )
 
 # ================================================================ paths
@@ -41,6 +46,7 @@ DENO = BIN_DIR / "deno.exe"
 MPV_DLL = BIN_DIR / "mpv-2.dll"
 LIB_FILE = DATA_DIR / "library.json"
 CFG_FILE = DATA_DIR / "config.json"
+COVER_DIR = DATA_DIR / "covers"
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 UA = {"User-Agent": "PersonalMusicPlayer/2.0"}
@@ -59,7 +65,9 @@ def resource_path(name):
 # ================================================================ config + library
 DEFAULT_CFG = {"volume": 70, "autoplay": True, "quality": "best",
                "glass_blur": False, "shuffle": False,
-               "theme": "light", "language": "en"}
+               "theme": "light", "language": "en",
+               "auto_download": True, "download_dir": "",
+               "discord": False, "discord_id": ""}
 
 
 def load_json(path, default):
@@ -328,6 +336,75 @@ def apply_blur_win10(hwnd):
 
 
 # ================================================================ threads
+def download_audio(vid, folder, saver=False, progress=None):
+    """Download the audio of a YouTube video as-is (m4a/opus, no ffmpeg needed)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    sel = "worstaudio[ext=m4a]/worstaudio" if saver else "bestaudio[ext=m4a]/bestaudio/best"
+    cmd = [str(YTDLP), f"https://www.youtube.com/watch?v={vid}", "-f", sel,
+           "--no-playlist", "--windows-filenames", "--trim-filenames", "120",
+           "--no-warnings", "--no-colors", "--newline",
+           "--progress-template", "download:PCT %(progress._percent_str)s",
+           "-o", str(folder / "%(title)s [%(id)s].%(ext)s")]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace",
+                            creationflags=NO_WINDOW, stdin=subprocess.DEVNULL)
+    tail = []
+    for line in proc.stdout:
+        line = line.strip()
+        m = re.search(r"PCT\s+(\d+(?:\.\d+)?)%", line)
+        if m:
+            if progress:
+                progress(int(float(m.group(1))))
+        elif line:
+            tail = (tail + [line])[-6:]
+    proc.wait()
+    for f in folder.iterdir():
+        if f"[{vid}]" in f.name and f.suffix.lower() not in (".part", ".ytdl", ".temp"):
+            if progress:
+                progress(100)
+            return f
+    raise RuntimeError(" ".join(tail)[-300:] or "Download failed")
+
+
+class DownloadWorker(QThread):
+    status = Signal(str)
+    progress = Signal(int)
+    got = Signal(object, object)   # new local track, target playlist
+    done = Signal(int, int)        # ok, failed
+
+    def __init__(self, tracks, folder, saver, playlist):
+        super().__init__()
+        self.tracks, self.folder, self.saver, self.playlist = tracks, folder, saver, playlist
+
+    def run(self):
+        ok = bad = 0
+        for i, t in enumerate(self.tracks, 1):
+            self.status.emit(tr("Downloading {i}/{n}: {title}").format(
+                i=i, n=len(self.tracks), title=t["title"]))
+            try:
+                self.progress.emit(0)
+                path = download_audio(t["vid"], self.folder, self.saver,
+                                      lambda p: self.progress.emit(p))
+                try:  # keep the cover so it also shows offline
+                    COVER_DIR.mkdir(parents=True, exist_ok=True)
+                    cache = COVER_DIR / f"{t['vid']}.jpg"
+                    if not cache.exists():
+                        try:
+                            data = fetch_bytes(f"https://i.ytimg.com/vi/{t['vid']}/maxresdefault.jpg")
+                        except Exception:
+                            data = fetch_bytes(f"https://i.ytimg.com/vi/{t['vid']}/mqdefault.jpg")
+                        cache.write_bytes(data)
+                except Exception:
+                    pass
+                self.got.emit({"id": "file:" + str(path), "kind": "file", "path": str(path),
+                               "vid": t["vid"], "title": t["title"], "artist": t.get("artist", ""),
+                               "duration": t.get("duration", 0)}, self.playlist)
+                ok += 1
+            except Exception:
+                bad += 1
+        self.done.emit(ok, bad)
+
+
 class Task(QThread):
     ok = Signal(object)
     failed = Signal(str)
@@ -480,6 +557,24 @@ PT = {
     "No": "Não",
     "OK": "OK",
     "Cancel": "Cancelar",
+    "Download": "Baixar",
+    "Downloading {i}/{n}: {title}": "Baixando {i}/{n}: {title}",
+    "Downloaded {ok} song(s).": "{ok} música(s) baixada(s).",
+    "{bad} download(s) failed.": "{bad} download(s) falharam.",
+    "Already downloaded.": "Já baixada.",
+    "Downloads": "Downloads",
+    "Download songs when saving them": "Baixar músicas ao salvá-las",
+    "Download folder: {path}": "Pasta de downloads: {path}",
+    "Change folder": "Mudar pasta",
+    "Open folder": "Abrir pasta",
+    "Choose download folder": "Escolher pasta de downloads",
+    "Download and add to Library": "Baixar e adicionar à Biblioteca",
+    "Download and save to device": "Baixar e salvar no dispositivo",
+    "Back to now playing": "Voltar ao que está tocando",
+    "Saved {ok} song(s) to your device.": "{ok} música(s) salva(s) no dispositivo.",
+    "Show what I'm playing on Discord": "Mostrar o que estou ouvindo no Discord",
+    "Discord Application ID": "ID do aplicativo do Discord",
+    'Create a free app at <a href="https://discord.com/developers/applications">discord.com/developers</a>, name it (people will see this name), then paste its Application ID here. The Discord desktop app must be open.': 'Crie um app gratuito em <a href="https://discord.com/developers/applications">discord.com/developers</a>, dê um nome a ele (as pessoas verão esse nome) e cole aqui o ID do aplicativo. O app do Discord precisa estar aberto.',
 }
 
 
@@ -661,6 +756,107 @@ def glass():
 
 
 # ================================================================ main window
+def fade_in(w, ms=220):
+    """Smoothly fade a widget in (used for tab changes, covers, titles, lists)."""
+    try:
+        old = getattr(w, "_fade_anim", None)
+        if old is not None:
+            try:
+                old.stop()
+            except RuntimeError:
+                pass
+        eff = QGraphicsOpacityEffect(w)
+        eff.setOpacity(0.0)
+        w.setGraphicsEffect(eff)
+        anim = QPropertyAnimation(eff, b"opacity", w)
+        anim.setDuration(ms)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+
+        def done():
+            try:
+                if w.graphicsEffect() is eff:
+                    w.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+
+        anim.finished.connect(done)
+        w._fade_anim = anim
+        anim.start()
+    except Exception:
+        pass
+
+
+class FadeStack(QStackedWidget):
+    """Stacked widget that fades the new page in."""
+    def setCurrentIndex(self, i):
+        if i == self.currentIndex():
+            return
+        super().setCurrentIndex(i)
+        w = self.currentWidget()
+        if w is not None:
+            fade_in(w, 240)
+
+
+def rp(text):
+    """Discord wants 2-128 characters."""
+    text = (text or "").strip()[:120]
+    return text if len(text) >= 2 else text + "  "
+
+
+class DiscordRPC(threading.Thread):
+    """Talks to the Discord desktop app on its own thread. Fails silently."""
+    def __init__(self, client_id):
+        super().__init__(daemon=True)
+        self.client_id = client_id
+        self.q = queue.Queue()
+        self.rpc = None
+        self.start()
+
+    def run(self):
+        try:
+            import asyncio
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        except Exception:
+            pass
+        while True:
+            cmd, data = self.q.get()
+            if cmd == "stop":
+                break
+            try:
+                if self.rpc is None:
+                    from pypresence import Presence
+                    self.rpc = Presence(self.client_id)
+                    self.rpc.connect()
+                if cmd == "update":
+                    self.rpc.update(**data)
+                elif cmd == "clear":
+                    self.rpc.clear()
+            except Exception:
+                try:
+                    if self.rpc:
+                        self.rpc.close()
+                except Exception:
+                    pass
+                self.rpc = None   # reconnect on the next update
+        try:
+            if self.rpc:
+                self.rpc.clear()
+                self.rpc.close()
+        except Exception:
+            pass
+
+    def update(self, **data):
+        self.q.put(("update", data))
+
+    def clear(self):
+        self.q.put(("clear", {}))
+
+    def stop(self):
+        self.q.put(("stop", {}))
+
+
 class TrackList(QListWidget):
     """List that can play a song with a single left click."""
     clicked_item = Signal(object)
@@ -669,6 +865,8 @@ class TrackList(QListWidget):
         super().__init__()
         self.single_click = single_click
         self._press = None
+        self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.verticalScrollBar().setSingleStep(18)
 
     def mousePressEvent(self, e):
         self._press = self.itemAt(e.position().toPoint())
@@ -705,6 +903,9 @@ class MainWindow(QWidget):
         self.tasks = []
         self.queue, self.qi, self.current = [], -1, None
         self.history, self.played_ids, self.ended = [], set(), False
+        self.dl_jobs, self.dl_worker, self.dl_library = [], None, True
+        self.preview, self.shown_id = None, None
+        self.rpc, self.is_paused, self.cur_pos = None, False, 0.0
         self.dur, self.seeking, self.started, self.got_dur = 0.0, False, False, False
 
         self.win_build = sys.getwindowsversion().build if hasattr(sys, "getwindowsversion") else 0
@@ -717,6 +918,7 @@ class MainWindow(QWidget):
         self.build_ui()
         self.refresh_playlists()
         self.refresh_versions()
+        self.rpc_setup()
 
     # ---------------------------------------------------------- engine
     def init_player(self):
@@ -758,7 +960,7 @@ class MainWindow(QWidget):
         pl = QHBoxLayout(pill)
         pl.setContentsMargins(5, 5, 5, 5)
         pl.setSpacing(2)
-        self.stack = QStackedWidget()
+        self.stack = FadeStack()
         group = QButtonGroup(self)
         group.setExclusive(True)
         for i, name in enumerate(("Library", "Search", "Settings")):
@@ -783,6 +985,11 @@ class MainWindow(QWidget):
         self.status = QLabel("")
         self.status.setObjectName("dim")
         ll.addWidget(self.status)
+        self.dl_bar = QProgressBar()
+        self.dl_bar.setRange(0, 100)
+        self.dl_bar.setStyleSheet("QProgressBar { height: 18px; }")
+        self.dl_bar.setVisible(False)
+        ll.addWidget(self.dl_bar)
         root.addWidget(left, 1)
 
         # ---- right panel (now playing)
@@ -808,10 +1015,16 @@ class MainWindow(QWidget):
         rl.addWidget(self.artist_lbl)
         rl.addSpacing(8)
 
+        self.mid = FadeStack()
+
+        tp = QWidget()                       # page 0: player controls
+        tl = QVBoxLayout(tp)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(6)
         self.seek = QSlider(Qt.Horizontal)
         self.seek.sliderPressed.connect(lambda: setattr(self, "seeking", True))
         self.seek.sliderReleased.connect(self.do_seek)
-        rl.addWidget(self.seek)
+        tl.addWidget(self.seek)
         times = QHBoxLayout()
         self.t_left, self.t_right = QLabel("0:00"), QLabel("0:00")
         for l in (self.t_left, self.t_right):
@@ -819,8 +1032,7 @@ class MainWindow(QWidget):
         times.addWidget(self.t_left)
         times.addStretch()
         times.addWidget(self.t_right)
-        rl.addLayout(times)
-
+        tl.addLayout(times)
         ctr = QHBoxLayout()
         prev = QPushButton("|\u25C0")
         prev.setObjectName("icon")
@@ -836,7 +1048,27 @@ class MainWindow(QWidget):
         ctr.addWidget(self.play_btn)
         ctr.addWidget(nxt)
         ctr.addStretch()
-        rl.addLayout(ctr)
+        tl.addLayout(ctr)
+        self.mid.addWidget(tp)
+
+        ap = QWidget()                       # page 1: choices for a search result
+        al = QVBoxLayout(ap)
+        al.setContentsMargins(0, 8, 0, 0)
+        al.setSpacing(8)
+        self.act_play = QPushButton(tr("Play"))
+        self.act_play.clicked.connect(self.play_preview)
+        self.act_lib = QPushButton(tr("Download and add to Library"))
+        self.act_lib.clicked.connect(lambda: self.preview and self.start_download([self.preview], None, True))
+        self.act_dev = QPushButton(tr("Download and save to device"))
+        self.act_dev.clicked.connect(lambda: self.preview and self.start_download([self.preview], None, False))
+        self.act_back = QPushButton(tr("Back to now playing"))
+        self.act_back.setObjectName("tab")
+        self.act_back.clicked.connect(self.show_now_playing)
+        for b_ in (self.act_play, self.act_lib, self.act_dev, self.act_back):
+            al.addWidget(b_)
+        self.mid.addWidget(ap)
+
+        rl.addWidget(self.mid)
         rl.addStretch()
 
         vrow = QHBoxLayout()
@@ -902,19 +1134,17 @@ class MainWindow(QWidget):
         row.addWidget(self.search_box, 1)
         row.addWidget(go)
         lay.addLayout(row)
-        self.res_list = QListWidget()
+        self.res_list = TrackList(single_click=True)
         self.res_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.res_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.res_list.customContextMenuRequested.connect(lambda pos: self.track_menu(self.res_list, pos, "search"))
         self.res_list.itemDoubleClicked.connect(lambda it: self.play_item(self.res_list, it))
+        self.res_list.clicked_item.connect(self.preview_track)
         lay.addWidget(self.res_list, 1)
         brow = QHBoxLayout()
-        self.add_pl_btn = QPushButton(tr("Add selected to playlist"))
+        self.add_pl_btn = QPushButton(tr("Add to playlist"))
         self.add_pl_btn.clicked.connect(self.search_add_menu)
-        save = QPushButton(tr("Save to library"))
-        save.clicked.connect(lambda: self.save_tracks(self.selected_tracks(self.res_list)))
         brow.addWidget(self.add_pl_btn)
-        brow.addWidget(save)
         lay.addLayout(brow)
         return w
 
@@ -988,6 +1218,39 @@ class MainWindow(QWidget):
         self.blur_chk.toggled.connect(self.on_blur)
         lay.addWidget(self.blur_chk)
 
+        lay.addWidget(head("Discord"))
+        self.dc_chk = QCheckBox(tr("Show what I'm playing on Discord"))
+        self.dc_chk.setChecked(self.cfg["discord"])
+        self.dc_chk.toggled.connect(self.on_discord)
+        lay.addWidget(self.dc_chk)
+        self.dc_id = QLineEdit(self.cfg["discord_id"])
+        self.dc_id.setPlaceholderText(tr("Discord Application ID"))
+        self.dc_id.editingFinished.connect(self.on_discord_id)
+        lay.addWidget(self.dc_id)
+        dh = QLabel(tr('Create a free app at <a href="https://discord.com/developers/applications">discord.com/developers</a>, name it (people will see this name), then paste its Application ID here. The Discord desktop app must be open.'))
+        dh.setObjectName("small")
+        dh.setWordWrap(True)
+        dh.setOpenExternalLinks(True)
+        lay.addWidget(dh)
+
+        lay.addWidget(head(tr("Downloads")))
+        self.dl_chk = QCheckBox(tr("Download songs when saving them"))
+        self.dl_chk.setChecked(self.cfg["auto_download"])
+        self.dl_chk.toggled.connect(self.on_auto_download)
+        lay.addWidget(self.dl_chk)
+        self.dl_lbl = QLabel(tr("Download folder: {path}").format(path=self.download_dir()))
+        self.dl_lbl.setWordWrap(True)
+        lay.addWidget(self.dl_lbl)
+        drow = QHBoxLayout()
+        dchg = QPushButton(tr("Change folder"))
+        dchg.clicked.connect(self.change_download_dir)
+        dopen = QPushButton(tr("Open folder"))
+        dopen.clicked.connect(self.open_download_dir)
+        drow.addWidget(dchg)
+        drow.addWidget(dopen)
+        drow.addStretch()
+        lay.addLayout(drow)
+
         lay.addWidget(head(tr("Data")))
         lay.addWidget(QLabel(tr("Saved in: {path}").format(path=DATA_DIR)))
         op = QPushButton(tr("Open data folder"))
@@ -1027,7 +1290,7 @@ class MainWindow(QWidget):
     # ---------------------------------------------------------- helpers
     def toast(self, text):
         self.status.setText(text)
-        QTimer.singleShot(3500, lambda: self.status.setText(""))
+        QTimer.singleShot(3500, lambda: self.status.text() == text and self.status.setText(""))
 
     def run_task(self, fn, label, refresh=False):
         self.set_info.setText(label)
@@ -1124,6 +1387,7 @@ class MainWindow(QWidget):
             self.lib_list.addItem(tr("Empty. Add music files or save songs from Search."))
         for t in tracks:
             self.lib_list.addItem(make_item(t))
+        fade_in(self.lib_list, 200)
 
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -1163,6 +1427,9 @@ class MainWindow(QWidget):
             self.refresh_playlists()
 
     def add_to_playlist(self, name, tracks):
+        tracks = self.route_downloads(tracks, name)
+        if not tracks:
+            return
         for t in tracks:
             self.lib.add_track(t)
             if t["id"] not in self.lib.playlists[name]:
@@ -1173,6 +1440,9 @@ class MainWindow(QWidget):
         self.toast(tr("Added {n} song(s) to '{name}'.").format(n=len(tracks), name=name))
 
     def save_tracks(self, tracks):
+        if not tracks:
+            return
+        tracks = self.route_downloads(tracks, None)
         if not tracks:
             return
         for t in tracks:
@@ -1198,6 +1468,9 @@ class MainWindow(QWidget):
         tracks = [i.data(Qt.UserRole) for i in items]
         m = QMenu(self)
         add_action(m, tr("Play"), lambda: self.play_item(lw, items[0]))
+        yts = [t for t in tracks if t["kind"] == "yt"]
+        if yts:
+            add_action(m, tr("Download"), lambda: self.start_download(yts))
         self.fill_playlist_menu(m.addMenu(tr("Add to playlist")), tracks)
         if where == "library":
             pl = self.current_playlist()
@@ -1220,6 +1493,146 @@ class MainWindow(QWidget):
             self.lib.remove_track(t["id"])
         self.lib.save()
         self.refresh_library_list()
+
+    # ---------------------------------------------------------- downloads
+    def download_dir(self):
+        return Path(self.cfg.get("download_dir") or str(Path.home() / "Music" / "WawaPlayer"))
+
+    def local_copy(self, vid):
+        for t in self.lib.tracks.values():
+            if t.get("vid") == vid and t["kind"] == "file" and os.path.exists(t["path"]):
+                return t
+        return None
+
+    def route_downloads(self, tracks, playlist):
+        """Returns the tracks to add right now; YouTube ones are downloaded first."""
+        now, remote = [], []
+        for t in tracks:
+            if t["kind"] == "yt":
+                local = self.local_copy(t["vid"])
+                if local:
+                    now.append(local)
+                else:
+                    remote.append(t)
+            else:
+                now.append(t)
+        if remote:
+            if self.cfg["auto_download"]:
+                self.start_download(remote, playlist)
+            else:
+                now.extend(remote)
+        return now
+
+    def start_download(self, tracks, playlist=None, library=True):
+        fresh = [t for t in tracks if t["kind"] == "yt"]
+        if library:
+            fresh = [t for t in fresh if not self.local_copy(t["vid"])]
+        if not fresh:
+            if tracks:
+                self.toast(tr("Already downloaded."))
+            return
+        self.dl_jobs.append((fresh, playlist, library))
+        self.next_download()
+
+    def next_download(self):
+        if self.dl_worker is not None or not self.dl_jobs:
+            return
+        tracks, playlist, library = self.dl_jobs.pop(0)
+        self.dl_library = library
+        w = DownloadWorker(tracks, self.download_dir(), self.cfg["quality"] != "best", playlist)
+        w.status.connect(self.status.setText)
+        w.progress.connect(self.dl_bar.setValue)
+        w.got.connect(self.on_downloaded)
+        w.done.connect(self.on_download_done)
+        self.dl_worker = w
+        self.dl_bar.setValue(0)
+        self.dl_bar.setVisible(True)
+        w.start()
+
+    def on_downloaded(self, t, playlist):
+        if not self.dl_library:
+            return                       # saved to the device only
+        old = "yt:" + t["vid"]          # replace a streaming entry with the local file
+        if old in self.lib.tracks:
+            for ids in self.lib.playlists.values():
+                for i, x in enumerate(ids):
+                    if x == old:
+                        ids[i] = t["id"]
+            self.lib.tracks.pop(old, None)
+        self.lib.add_track(t)
+        if playlist in self.lib.playlists and t["id"] not in self.lib.playlists[playlist]:
+            self.lib.playlists[playlist].append(t["id"])
+        self.lib.save()
+        if self.current_playlist() in (None, playlist):
+            self.refresh_library_list()
+
+    def on_download_done(self, ok, bad):
+        self.dl_worker = None
+        self.dl_bar.setVisible(False)
+        key = "Downloaded {ok} song(s)." if self.dl_library else "Saved {ok} song(s) to your device."
+        msg = tr(key).format(ok=ok)
+        if bad:
+            msg += "  " + tr("{bad} download(s) failed.").format(bad=bad)
+        self.toast(msg)
+        self.next_download()
+
+    # ---------------------------------------------------------- discord
+    def rpc_setup(self):
+        if self.rpc:
+            self.rpc.stop()
+            self.rpc = None
+        cid = (self.cfg.get("discord_id") or "").strip()
+        if self.cfg.get("discord") and cid.isdigit():
+            self.rpc = DiscordRPC(cid)
+
+    def rpc_clear(self):
+        if self.rpc:
+            self.rpc.clear()
+
+    def rpc_refresh(self):
+        if not self.rpc or not self.current:
+            return
+        t = self.current
+        artist = t.get("artist") or ""
+        data = {"details": rp(t["title"]), "state": rp(artist or "Wawa Player")}
+        if self.is_paused:
+            data["state"] = rp("Paused" + (" - " + artist if artist else ""))
+        elif self.got_dur and self.dur:
+            start = int(time.time() - self.cur_pos)
+            data["start"] = start
+            data["end"] = int(start + self.dur)
+        if t.get("vid"):
+            data["large_image"] = f"https://i.ytimg.com/vi/{t['vid']}/hqdefault.jpg"
+            data["large_text"] = rp(t["title"])
+        self.rpc.update(**data)
+
+    def on_discord(self, on):
+        self.cfg["discord"] = on
+        self.save_cfg()
+        self.rpc_setup()
+        self.rpc_refresh()
+
+    def on_discord_id(self):
+        self.cfg["discord_id"] = self.dc_id.text().strip()
+        self.save_cfg()
+        self.rpc_setup()
+        self.rpc_refresh()
+
+    def on_auto_download(self, on):
+        self.cfg["auto_download"] = on
+        self.save_cfg()
+
+    def change_download_dir(self):
+        d = QFileDialog.getExistingDirectory(self, tr("Choose download folder"), str(self.download_dir()))
+        if d:
+            self.cfg["download_dir"] = d
+            self.dl_lbl.setText(tr("Download folder: {path}").format(path=self.download_dir()))
+            self.save_cfg()
+
+    def open_download_dir(self):
+        d = self.download_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(d)))
 
     def search_add_menu(self):
         tracks = self.selected_tracks(self.res_list)
@@ -1249,8 +1662,54 @@ class MainWindow(QWidget):
             self.res_list.addItem(tr("No results."))
         for t in tracks:
             self.res_list.addItem(make_item(t))
+        fade_in(self.res_list, 200)
 
     # ---------------------------------------------------------- playback
+    def set_cover(self, data):
+        self.cover.setPixmap(rounded_cover(data, self.COVER))
+        fade_in(self.cover, 320)
+
+    def preview_track(self, item):
+        t = item.data(Qt.UserRole)
+        if not t:
+            return
+        self.preview = t
+        self.shown_id = t["id"]
+        self.title_lbl.setText(t["title"])
+        self.artist_lbl.setText(t.get("artist") or "")
+        fade_in(self.title_lbl, 220)
+        fade_in(self.artist_lbl, 220)
+        self.cover.setPixmap(rounded_cover(None, self.COVER))
+        yt = t["kind"] == "yt"
+        self.act_lib.setEnabled(yt)
+        self.act_dev.setEnabled(yt)
+        self.act_back.setVisible(self.current is not None)
+        self.mid.setCurrentIndex(1)
+        self.load_cover(t)
+
+    def play_preview(self):
+        t = self.preview
+        if not t:
+            return
+        tracks = tracks_of(self.res_list)
+        ids = [x["id"] for x in tracks]
+        if t["id"] not in ids:
+            tracks, ids = [t], [t["id"]]
+        self.queue, self.qi = tracks, ids.index(t["id"])
+        self.history, self.played_ids = [], set()
+        self.play_current()
+
+    def show_now_playing(self):
+        t = self.current
+        if t:
+            self.shown_id = t["id"]
+            self.title_lbl.setText(t["title"])
+            self.artist_lbl.setText(t.get("artist") or "")
+            fade_in(self.title_lbl, 220)
+            fade_in(self.artist_lbl, 220)
+            self.load_cover(t)
+        self.mid.setCurrentIndex(0)
+
     def play_item(self, lw, item):
         if not item.data(Qt.UserRole):
             return
@@ -1273,29 +1732,51 @@ class MainWindow(QWidget):
         self.ended = False
         self.got_dur = False
         self.played_ids.add(t["id"])
+        self.shown_id = t["id"]
+        self.cur_pos, self.is_paused = 0.0, False
         self.title_lbl.setText(t["title"])
         self.artist_lbl.setText(tr("Loading from YouTube...") if t["kind"] == "yt"
                                 else (t.get("artist") or ""))
+        fade_in(self.title_lbl, 260)
+        fade_in(self.artist_lbl, 260)
         self.seek.setValue(0)
         self.cover.setPixmap(rounded_cover(None, self.COVER))
+        self.mid.setCurrentIndex(0)
         self.player.pause = False
         self.player.play(src)
         self.load_cover(t)
+        self.rpc_refresh()
 
     def load_cover(self, t):
         def work():
             if t["kind"] == "file":
-                return read_cover(t["path"])
+                data = read_cover(t["path"])
+                if data or not t.get("vid"):
+                    return data
+            vid = t.get("vid")
+            if not vid:
+                return None
+            cache = COVER_DIR / f"{vid}.jpg"
+            try:
+                if cache.exists():
+                    return cache.read_bytes()
+            except Exception:
+                pass
             for q in ("maxresdefault", "mqdefault"):
                 try:
-                    return fetch_bytes(f"https://i.ytimg.com/vi/{t['vid']}/{q}.jpg")
+                    data = fetch_bytes(f"https://i.ytimg.com/vi/{vid}/{q}.jpg")
+                    try:
+                        COVER_DIR.mkdir(parents=True, exist_ok=True)
+                        cache.write_bytes(data)
+                    except Exception:
+                        pass
+                    return data
                 except Exception:
                     pass
             return None
         task = Task(work)
         tid = t["id"]
-        task.ok.connect(lambda data: self.current and self.current["id"] == tid and data
-                        and self.cover.setPixmap(rounded_cover(data, self.COVER)))
+        task.ok.connect(lambda data: self.shown_id == tid and data and self.set_cover(data))
         self.tasks.append(task)
         task.start()
 
@@ -1369,14 +1850,18 @@ class MainWindow(QWidget):
             self.seek.setValue(0)
             self.t_left.setText("0:00")
             self.play_btn.setText("\u25B6")
+            self.rpc_clear()
 
     def do_seek(self):
         self.ended = False
         self.player.seek(self.seek.value(), reference="absolute")
         self.seeking = False
+        self.cur_pos = self.seek.value()
+        self.rpc_refresh()
 
     # ---------------------------------------------------------- mpv events
     def on_pos(self, t):
+        self.cur_pos = t
         if not self.seeking:
             self.seek.setValue(int(t))
         self.t_left.setText(fmt(t))
@@ -1386,11 +1871,14 @@ class MainWindow(QWidget):
         self.got_dur = True
         self.seek.setRange(0, int(d))
         self.t_right.setText(fmt(d))
-        if self.current:
+        if self.current and self.shown_id == self.current["id"]:
             self.artist_lbl.setText(self.current.get("artist") or "")
+        self.rpc_refresh()
 
     def on_paused(self, p):
+        self.is_paused = p
         self.play_btn.setText("\u25B6" if p else "\u275A\u275A")
+        self.rpc_refresh()
 
     def on_eof(self, reached):
         if reached:
@@ -1410,6 +1898,8 @@ class MainWindow(QWidget):
 
     def closeEvent(self, e):
         self.save_cfg()
+        if self.rpc:
+            self.rpc.stop()
         try:
             self.player.terminate()
         except Exception:
